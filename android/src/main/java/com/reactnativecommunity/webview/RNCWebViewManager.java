@@ -12,10 +12,13 @@ import android.graphics.Color;
 import android.Manifest;
 import android.net.http.SslError;
 import android.net.Uri;
+import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Environment;
 import android.os.Message;
 import android.os.SystemClock;
+import android.security.KeyChain;
+import android.security.KeyChainException;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Gravity;
@@ -24,6 +27,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewGroup.LayoutParams;
 import android.view.WindowManager;
+import android.webkit.ClientCertRequest;
 import android.webkit.ConsoleMessage;
 import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
@@ -94,6 +98,8 @@ import java.lang.IllegalArgumentException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLEncoder;
+import java.security.PrivateKey;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -216,8 +222,8 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
         RNCWebViewModule module = getModule(reactContext);
 
-        DownloadManager.Request request;
-        try {
+        DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+          try {
           request = new DownloadManager.Request(Uri.parse(url));
         } catch (IllegalArgumentException e) {
           Log.w(TAG, "Unsupported URI, aborting download", e);
@@ -235,7 +241,8 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
           String cookie = CookieManager.getInstance().getCookie(baseUrl);
           request.addRequestHeader("Cookie", cookie);
         } catch (MalformedURLException e) {
-          Log.w(TAG, "Error getting cookie for DownloadManager", e);
+          System.out.println("Error getting cookie for DownloadManager: " + e.toString());
+          e.printStackTrace();
         }
 
         //Finish setting up request
@@ -660,7 +667,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   @Override
   protected void addEventEmitters(ThemedReactContext reactContext, WebView view) {
     // Do not register default touch emitter and let WebView implementation handle touches
-    view.setWebViewClient(new RNCWebViewClient());
+    view.setWebViewClient(new RNCWebViewClient(reactContext));
   }
 
   @Override
@@ -874,12 +881,17 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
   protected static class RNCWebViewClient extends WebViewClient {
 
+    protected ReactContext mReactContext;
     protected boolean mLastLoadFailed = false;
     protected @Nullable
     ReadableArray mUrlPrefixesForDefaultIntent;
     protected RNCWebView.ProgressChangedFilter progressChangedFilter = null;
     protected @Nullable String ignoreErrFailedForThisURL = null;
     protected @Nullable BasicAuthCredential basicAuthCredential = null;
+
+    public RNCWebViewClient(ReactContext reactContext) {
+      this.mReactContext = reactContext;
+    }
 
     public void setIgnoreErrFailedForThisURL(@Nullable String url) {
       ignoreErrFailedForThisURL = url;
@@ -973,6 +985,18 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
       return this.shouldOverrideUrlLoading(view, url);
     }
 
+    @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
+    @Override
+    public void onReceivedClientCertRequest(WebView view, ClientCertRequest request) {
+      KeyChain.choosePrivateKeyAlias(mReactContext.getCurrentActivity(), alias -> {
+        if (alias == null) {
+          request.cancel();
+          return;
+        }
+        new RNCWebView.KeyChainCertificateRequest(mReactContext.getCurrentActivity().getApplicationContext(), request, alias).execute();
+      }, request.getKeyTypes(), request.getPrincipals(), request.getHost(), request.getPort(), null);
+    }
+
     @Override
     public void onReceivedHttpAuthRequest(WebView view, HttpAuthHandler handler, String host, String realm) {
       if (basicAuthCredential != null) {
@@ -998,7 +1022,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
         if (!topWindowUrl.equalsIgnoreCase(failingUrl)) {
           // If error is not due to top-level navigation, then do not call onReceivedError()
-          Log.w(TAG, "Resource blocked from loading due to SSL error. Blocked URL: "+failingUrl);
+          Log.w("RNCWebViewManager", "Resource blocked from loading due to SSL error. Blocked URL: "+failingUrl);
           return;
         }
 
@@ -1107,10 +1131,10 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
         super.onRenderProcessGone(webView, detail);
 
         if(detail.didCrash()){
-          Log.e(TAG, "The WebView rendering process crashed.");
+          Log.e("RNCWebViewManager", "The WebView rendering process crashed.");
         }
         else{
-          Log.w(TAG, "The WebView rendering process was killed by the system.");
+          Log.w("RNCWebViewManager", "The WebView rendering process was killed by the system.");
         }
 
         // if webView is null, we cannot return any event
@@ -1781,6 +1805,37 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
       public boolean isWaitingForCommandLoadUrl() {
         return waitingForCommandLoadUrl;
+      }
+    }
+
+    protected static class KeyChainCertificateRequest extends AsyncTask<Void, Void, Void> {
+      private final Context mContext;
+      private final ClientCertRequest mHandler;
+      private final String mAlias;
+
+      KeyChainCertificateRequest(Context context, ClientCertRequest handler, String alias) {
+        mContext = context;
+        mHandler = handler;
+        mAlias = alias;
+      }
+
+      @RequiresApi(api = Build.VERSION_CODES.LOLLIPOP)
+      @Override
+      protected Void doInBackground(Void... params) {
+        PrivateKey privateKey;
+        X509Certificate[] certificateChain;
+        try {
+          privateKey = KeyChain.getPrivateKey(mContext, mAlias);
+          certificateChain = KeyChain.getCertificateChain(mContext, mAlias);
+        } catch (InterruptedException e) {
+          mHandler.ignore();
+          return null;
+        } catch (KeyChainException e) {
+          mHandler.ignore();
+          return null;
+        }
+        mHandler.proceed(privateKey, certificateChain);
+        return null;
       }
     }
   }
